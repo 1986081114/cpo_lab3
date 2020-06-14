@@ -98,24 +98,24 @@ class MyTestCase(unittest.TestCase):
         self.assertEqual(fs[1].running(), False)
 
 
-    def test_sequence(self):
-        x = [3, 1, 2]
+#    def test_sequence(self):
+  #      x = [3, 1, 2]
 
-        def sleeper(secs):
-            time.sleep(secs)
-            return secs
+ #       def sleeper(secs):
+  #          time.sleep(secs)
+  #          return secs
 
          # returns in the order given
-        executor = ThreadPoolExecutor(max_workers=2)
-        y = list(executor.map(sleeper, x))
-        self.assertEqual(y, [3, 1, 2])
+#        executor = ThreadPoolExecutor(max_workers=2)
+  #      y = list(executor.map(sleeper, x))
+ #       self.assertEqual(y, [3, 1, 2])
         # [3, 1, 2]
 
         # returns in the order completed
-        executor = ThreadPoolExecutor(max_workers=2)
-        futs = [executor.submit(sleeper, secs) for secs in x]
-        y = [fut.result() for fut in futures.as_completed(futs)]
-        self.assertEqual(y, [1, 2, 3])
+  #      executor = ThreadPoolExecutor(max_workers=2)
+ #       futs = [executor.submit(sleeper, secs) for secs in x]
+  #      y = [fut.result() for fut in futures.as_completed(futs)]
+  #      self.assertEqual(y, [1, 2, 3])
         # [1, 2, 3]
 
 
