@@ -1,195 +1,148 @@
-import os
+import queue
 import threading
-import weakref
-from concurrent.futures import _base
-from concurrent.futures._base import LOGGER, FINISHED, RUNNING, CANCELLED, CANCELLED_AND_NOTIFIED, CancelledError
-from concurrent.futures.thread import _WorkItem, _worker
 
-from distributed.worker import PENDING
-from future.moves import queue
+
+
+class TimeoutError(Exception):
+    def __init__(self):
+        self.msg = 'error: TimeoutError'
+        print(self.msg)
+
+
+class CancelledError(Exception):
+    def __init__(self):
+        self.msg = 'error:Future has been cancelled.'
+        print(self.msg)
 
 
 class Future(object):
-
-
     def __init__(self):
-        self._condition = threading.Condition()
-        self._state = PENDING
         self._result = None
-        self._exception = None
-        self._waiters = []
-        self._done_callbacks = []
-
-
-    def _invoke_callbacks(self):
-        for callback in self._done_callbacks:
-            try:
-                callback(self)
-            except Exception:
-                LOGGER.exception('exception calling callback for %r', self)
-
-
-    def __repr__(self, _STATE_TO_DESCRIPTION_MAP=None):
-        with self._condition:
-            if self._state == FINISHED:
-                if self._exception:
-                    return '<%s at %#x state=%s raised %s>' % (
-                        self.__class__.__name__,
-                        id(self),
-                        _STATE_TO_DESCRIPTION_MAP[self._state],
-                        self._exception.__class__.__name__)
-                else:
-                    return '<%s at %#x state=%s returned %s>' % (
-                        self.__class__.__name__,
-                        id(self),
-                        _STATE_TO_DESCRIPTION_MAP[self._state],
-                        self._result.__class__.__name__)
-            return '<%s at %#x state=%s>' % (
-                self.__class__.__name__,
-                id(self),
-                _STATE_TO_DESCRIPTION_MAP[self._state])
-
-    def cancel(self):
-
-        with self._condition:
-            if self._state in [RUNNING, FINISHED]:
-                return False
-
-            if self._state in [CANCELLED, CANCELLED_AND_NOTIFIED]:
-                return True
-
-            self._state = CANCELLED
-            self._condition.notify_all()
-
-        self._invoke_callbacks()
-        return True
-
-    def cancelled(self):
-        with self._condition:
-            return self._state in [CANCELLED, CANCELLED_AND_NOTIFIED]
-
-    def running(self):
-        with self._condition:
-            return self._state == RUNNING
+        self._condition = threading.Condition()
+        self._state = 'PENDING'
 
     def done(self):
         with self._condition:
-            return self._state in [CANCELLED, CANCELLED_AND_NOTIFIED, FINISHED]
+            return self._state == 'FINISHED'
 
+    def running(self):
+        with self._condition:
+            return self._state == 'RUNNING'
+
+    def cancelled(self):
+        with self._condition:
+            return self._state == 'CANCELLED'
 
     def result(self, timeout=None):
         with self._condition:
-            if self._state in [CANCELLED, CANCELLED_AND_NOTIFIED]:
+            if self._state == 'CANCELLED':
                 raise CancelledError()
-            elif self._state == FINISHED:
-                return self.__get_result()
-
-            # 此处会阻塞，等待 notify
-            self._condition.wait(timeout)
-
-            if self._state in [CANCELLED, CANCELLED_AND_NOTIFIED]:
+            elif self._state == 'FINISHED':
+                return self._result
+            self._condition.wait(timeout)  # Block until future is done.
+            if self._state == 'CANCELLED':
                 raise CancelledError()
-            elif self._state == FINISHED:
-                return self.__get_result()
+            elif self._state == 'FINISHED':
+                return self._result
             else:
-                raise TimeoutError()
+                raise TimeoutError()  # Timeout.
 
-    def exception(self, timeout=None):
-
-        with self._condition:
-            if self._state in [CANCELLED, CANCELLED_AND_NOTIFIED]:
-                raise CancelledError()
-            elif self._state == FINISHED:
-                return self._exception
-
-            self._condition.wait(timeout)
-
-            if self._state in [CANCELLED, CANCELLED_AND_NOTIFIED]:
-                raise CancelledError()
-            elif self._state == FINISHED:
-                return self._exception
-            else:
-                raise TimeoutError()
-
-    # The following methods should only be used by Executors and in tests.
+    def cancel(self):
+        if self._state in ['RUNNING', 'FINISHED']:
+            return False
+        else:
+            self.set_cancelled()
 
     def set_result(self, result):
-        """Sets the return value of work associated with the future.
-
-        Should only be used by Executor implementations and unit tests.
-        """
-
         with self._condition:
             self._result = result
-            self._state = FINISHED
-            for waiter in self._waiters:
-                waiter.add_result(self)
+            self._state = 'FINISHED'
             self._condition.notify_all()
-        self._invoke_callbacks()
 
-    def set_exception(self, exception):
+    def set_running(self):
+        self._state = 'RUNNING'
 
-        with self._condition:
-            self._exception = exception
-            self._state = FINISHED
-            for waiter in self._waiters:
-                waiter.add_exception(self)
-            self._condition.notify_all()
-        self._invoke_callbacks()
+    def set_cancelled(self):
+        self._state = 'CANCELLED'
 
 
-class ThreadPoolExecutor(_base.Executor):
-    def __init__(self, max_workers=None):
+class ThreadPoolExecutor(object):
+
+    def __init__(self, max_workers=None, priority=False):
         if max_workers is None:
-            # Use this number because ThreadPoolExecutor is often
-            # used to overlap I/O instead of CPU work.
-            max_workers = (os.cpu_count() or 1) * 5
-        if max_workers <= 0:
-            raise ValueError("max_workers must be greater than 0")
+            max_workers = 4
+        elif max_workers <= 0:
+            raise ValueError('max_workers must be greater than 0')
 
         self._max_workers = max_workers
         self._work_queue = queue.Queue()
         self._threads = set()
-        self._shutdown = False
-        self._shutdown_lock = threading.Lock()
-
 
     def submit(self, fn, *args, **kwargs):
-        with self._shutdown_lock:
-            if self._shutdown:
-                raise RuntimeError('cannot schedule new futures after shutdown')
-
-            f = _base.Future()
-            w = _WorkItem(f, fn, args, kwargs)
-
-            self._work_queue.put(w)
-
-
-            return f
-
-    submit.__doc__ = _base.Executor.submit.__doc__
-
-    def _adjust_thread_count(self, _threads_queues=None):
-
-        def weakref_cb(_, q=self._work_queue):
-            q.put(None)
-
-        # TODO(bquinlan): Should avoid creating new threads if there are more
+        f = Future()
+        w = _WorkItem(None, f, fn, args, kwargs)
+        self._work_queue.put(w)
         if len(self._threads) < self._max_workers:
-            t = threading.Thread(target=_worker,
-                                 args=(weakref.ref(self, weakref_cb),
-                                       self._work_queue))
+            t = threading.Thread(target=_worker, args=(self._work_queue,))
             t.daemon = True
             t.start()
             self._threads.add(t)
-            _threads_queues[t] = self._work_queue
 
-    def shutdown(self, wait=True):
-        with self._shutdown_lock:
-            self._shutdown = True
-            self._work_queue.put(None)
-        if wait:
-            for t in self._threads:
-                t.join()
+        return f
 
-    shutdown.__doc__ = _base.Executor.shutdown.__doc__
+    def submit_with_priority(self, fn_dict):
+        fs = []
+        for fn in fn_dict.keys():
+            f = Future()
+            fs.append(f)
+            w = _WorkItem(fn_dict[fn]['priority'], f, fn, fn_dict[fn]['args'])
+            self._work_queue.put(w)
+        for thread_num in range(self._max_workers):
+            self._start_working()
+        return fs
+
+    def shutdown(self):
+        self._work_queue.join()
+
+    def map(self, fn, *iterables, timeout=None, chunksize=1):
+        pass
+
+    def _start_working(self):
+        """
+        Wake worker thread.
+        """
+        if len(self._threads) < self._max_workers:  # Running threads must smaller than maximum.
+            t = threading.Thread(target=_worker, args=(self._work_queue,))
+            t.daemon = True  # When main thread quits, children threads quit as well.
+            t.start()
+            self._threads.add(t)
+
+
+def _worker(work_queue, priority=False):
+    while True:
+        work_item = work_queue.get(block=True)
+        if work_item is not None:
+            work_item.run()
+            del work_item
+            work_queue.task_done()
+            continue
+
+
+class _WorkItem(object):
+    def __init__(self, priority, future, fn, args, kwargs=None):
+        self.future = future
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.priority = priority
+
+    def run(self):
+        self.future.set_running()
+        if self.kwargs is None:
+            result = self.fn(*self.args)
+        else:
+            result = self.fn(*self.args, *self.kwargs)
+        self.future.set_result(result)
+
+    def __lt__(self, other):
+        return self.priority <= other.priority
